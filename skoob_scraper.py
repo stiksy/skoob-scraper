@@ -9,8 +9,6 @@ import re
 import time
 import json
 from datetime import datetime
-from pathlib import Path
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from bs4 import BeautifulSoup
@@ -24,104 +22,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 SKOOB_BASE_URL = "https://www.skoob.com.br"
-LOGIN_URL = f"{SKOOB_BASE_URL}/login"
-# Hardcoded bookshelf URL with filter=read to only show read books
-ESTANTE_URL = "https://www.skoob.com.br/pt/user/67bd0d5270c4abc337699ac9/bookshelf?filter=read"
 
 
-def wait_for_manual_login(page):
-    """Wait for user to manually complete login."""
-    logger.info("Browser opened. Please log in manually in the browser window.")
-    logger.info("After logging in, return here and press Enter to continue...")
-    input("Press Enter after you have logged in...")
-    
-    # Wait a moment for any redirects to complete
-    time.sleep(2)
-    
-    # Check if we're logged in by looking for user-specific elements
-    try:
-        # Try to find elements that indicate logged-in state
-        # Common indicators: user menu, profile link, or specific logged-in content
-        page.wait_for_selector('a[href*="/pt/user/"], a[href*="/usuario/"]', timeout=5000)
-        logger.info("Authentication detected. Proceeding to scrape...")
-        return True
-    except PlaywrightTimeoutError:
-        logger.warning("Could not confirm authentication. Proceeding anyway...")
-        return True
-
-
-def get_user_id_from_page(page):
-    """Extract user ID from the current page."""
-    try:
-        # Try to find user ID from profile link or URL
-        # Look for links containing /pt/user/ or /usuario/ followed by user ID
-        user_link = page.query_selector('a[href*="/pt/user/"][href*="/bookshelf"], a[href*="/usuario/"][href*="/estante"]')
-        if user_link:
-            href = user_link.get_attribute('href')
-            if href:
-                # Extract user ID from URL like /pt/user/67bd0d5270c4abc337699ac9/bookshelf
-                if '/pt/user/' in href:
-                    parts = href.split('/pt/user/')
-                    if len(parts) > 1:
-                        user_id = parts[1].split('/')[0]
-                        return user_id
-                # Or /usuario/12345/estante (old format)
-                elif '/usuario/' in href:
-                    parts = href.split('/usuario/')
-                    if len(parts) > 1:
-                        user_id = parts[1].split('/')[0]
-                        return user_id
-        
-        # Alternative: check current URL if already on user page
-        current_url = page.url
-        if '/pt/user/' in current_url:
-            parts = current_url.split('/pt/user/')
-            if len(parts) > 1:
-                user_id = parts[1].split('/')[0]
-                return user_id
-        elif '/usuario/' in current_url:
-            parts = current_url.split('/usuario/')
-            if len(parts) > 1:
-                user_id = parts[1].split('/')[0]
-                return user_id
-        
-        # Try to find any link with user ID pattern
-        links = page.query_selector_all('a[href*="/pt/user/"], a[href*="/usuario/"]')
-        for link in links:
-            href = link.get_attribute('href')
-            if href:
-                if '/pt/user/' in href:
-                    parts = href.split('/pt/user/')
-                    if len(parts) > 1:
-                        user_id = parts[1].split('/')[0]
-                        # User IDs can be alphanumeric (like 67bd0d5270c4abc337699ac9)
-                        if user_id:
-                            return user_id
-                elif '/usuario/' in href:
-                    parts = href.split('/usuario/')
-                    if len(parts) > 1:
-                        user_id = parts[1].split('/')[0]
-                        if user_id.isdigit():
-                            return user_id
-        
-        return None
-    except Exception as e:
-        logger.error(f"Error extracting user ID: {e}")
-        return None
-
-
-def extract_book_data(book_element, book_id_map=None):
-    """Extract all available data from a book element.
-    
-    Args:
-        book_element: Playwright element containing book data
-        book_id_map: Optional dict mapping book titles (lowercase) to book IDs from API responses
-    """
-    book_data = {}
-    if book_id_map is None:
-        book_id_map = {}
-    
-    try:
+def scrape_book_details_http(book_url):
         # First, try to get title from image alt text (format: "Capa do livro [Title]")
         img_elem = book_element.query_selector('img[alt^="Capa do livro"]')
         if img_elem:
@@ -283,40 +186,122 @@ def extract_book_data(book_element, book_id_map=None):
                     continue
         
         # Method 2: Use JavaScript to find clickable elements and extract their navigation target
+        # Also try clicking the image to see where it navigates
         if not book_url:
             try:
-                book_url = book_element.evaluate('''(container) => {
-                    // Find all clickable elements (a, button, div with onClick)
-                    const clickable = container.querySelector('a, button, [onclick], [role="button"]');
-                    if (clickable) {
-                        // If it's an <a> tag, get href
-                        if (clickable.tagName === 'A' && clickable.href) {
-                            return clickable.href;
-                        }
-                        // Check for data attributes
-                        if (clickable.getAttribute('data-href')) {
-                            return clickable.getAttribute('data-href');
-                        }
-                        // Check parent elements for href
-                        let current = clickable.parentElement;
-                        for (let i = 0; i < 5 && current; i++) {
-                            if (current.tagName === 'A' && current.href) {
-                                return current.href;
+                # First, try to find the image and see if it has click handlers
+                img_elem = book_element.query_selector('img[alt^="Capa do livro"]')
+                if img_elem:
+                    # Try to get the parent element that might have the click handler
+                    try:
+                        # Get the parent that likely contains the navigation
+                        parent_elem = img_elem.evaluate('(img) => img.parentElement')
+                        if parent_elem:
+                            # Check if parent or any ancestor has an onclick or href
+                            book_url = book_element.evaluate('''(img) => {
+                                let current = img.parentElement;
+                                for (let i = 0; i < 10 && current; i++) {
+                                    // Check for href
+                                    if (current.href && (current.href.includes('/book/') || current.href.includes('/livro/'))) {
+                                        return current.href;
+                                    }
+                                    // Check for onclick that might navigate
+                                    if (current.onclick) {
+                                        const onclickStr = current.onclick.toString();
+                                        const bookMatch = onclickStr.match(/['"](\\/pt\\/book\\/|\\/book\\/|\\/livro\\/)(\\d+)['"]/);
+                                        if (bookMatch) {
+                                            return 'https://www.skoob.com.br/pt/book/' + bookMatch[2];
+                                        }
+                                    }
+                                    // Check data attributes
+                                    const dataHref = current.getAttribute('data-href') || current.getAttribute('href');
+                                    if (dataHref && (dataHref.includes('/book/') || dataHref.includes('/livro/'))) {
+                                        return dataHref;
+                                    }
+                                    current = current.parentElement;
+                                }
+                                return null;
+                            }''', img_elem)
+                    except Exception as e:
+                        logger.debug(f"Error checking image parent for navigation: {e}")
+                
+                # Fallback: try to find any clickable element
+                if not book_url:
+                    book_url = book_element.evaluate('''(container) => {
+                        // Find all clickable elements (a, button, div with onClick)
+                        const clickable = container.querySelector('a, button, [onclick], [role="button"]');
+                        if (clickable) {
+                            // If it's an <a> tag, get href
+                            if (clickable.tagName === 'A' && clickable.href) {
+                                return clickable.href;
                             }
-                            current = current.parentElement;
+                            // Check for data attributes
+                            if (clickable.getAttribute('data-href')) {
+                                return clickable.getAttribute('data-href');
+                            }
+                            // Check parent elements for href
+                            let current = clickable.parentElement;
+                            for (let i = 0; i < 5 && current; i++) {
+                                if (current.tagName === 'A' && current.href) {
+                                    return current.href;
+                                }
+                                current = current.parentElement;
+                            }
                         }
-                    }
-                    // Try to find any link in the container
-                    const anyLink = container.querySelector('a[href]');
-                    if (anyLink && anyLink.href) {
-                        return anyLink.href;
-                    }
-                    return null;
-                }''')
+                        // Try to find any link in the container
+                        const anyLink = container.querySelector('a[href]');
+                        if (anyLink && anyLink.href) {
+                            return anyLink.href;
+                        }
+                        return null;
+                    }''')
             except Exception as e:
                 logger.debug(f"Error finding URL via JavaScript: {e}")
         
-        # Method 3: Extract book ID from data attributes and construct URL
+        # Method 3: Try to extract URL from React component props
+        # This is more reliable than using image URLs (which contain edition IDs)
+        if not book_url:
+            try:
+                img_elem = book_element.query_selector('img[alt^="Capa do livro"]')
+                if img_elem:
+                    # Try to find the actual navigation target by checking React props
+                    book_url = img_elem.evaluate('''(img) => {
+                        // Walk up the DOM tree to find the Link component
+                        let current = img;
+                        for (let i = 0; i < 10 && current; i++) {
+                            // Check React Fiber props for href
+                            const keys = Object.keys(current);
+                            for (const key of keys) {
+                                if (key.startsWith('__reactFiber') || key.startsWith('__reactInternalInstance')) {
+                                    let fiber = current[key];
+                                    for (let j = 0; j < 20 && fiber; j++) {
+                                        if (fiber.memoizedProps) {
+                                            const props = fiber.memoizedProps;
+                                            // Check for href in props
+                                            if (props.href && (props.href.includes('/book/') || props.href.includes('/livro/'))) {
+                                                return props.href;
+                                            }
+                                            // Check for onClick that navigates
+                                            if (props.onClick) {
+                                                const onClickStr = props.onClick.toString();
+                                                const match = onClickStr.match(/['"](\\/pt\\/book\\/|\\/book\\/|\\/livro\\/)(\\d+)['"]/);
+                                                if (match) {
+                                                    return 'https://www.skoob.com.br/pt/book/' + match[2];
+                                                }
+                                            }
+                                        }
+                                        fiber = fiber.return || fiber._debugOwner;
+                                    }
+                                }
+                            }
+                            current = current.parentElement;
+                        }
+                        return null;
+                    }''')
+            except Exception as e:
+                logger.debug(f"Error extracting URL from React props: {e}")
+        
+        # Method 4: Extract book ID from data attributes and construct URL
         if not book_url:
             try:
                 # Check for book ID in data attributes
@@ -328,73 +313,73 @@ def extract_book_data(book_element, book_id_map=None):
                         book_id = value
                         break
                 
-                # If no data attribute, try to extract from image src or other attributes
-                if not book_id:
-                    img_elem = book_element.query_selector('img[alt^="Capa do livro"]')
-                    if img_elem:
-                        img_src = img_elem.get_attribute('src') or ''
-                        # Check if this is a nocover image (books without covers)
-                        if 'nocover' in img_src.lower():
-                            # For nocover books, we can't extract ID from image URL
-                            # Will try to get it from API response map later
-                            logger.debug(f"Found nocover image for book, will try API map: {img_src[:100]}")
-                        else:
-                            # Book IDs are in the image source URLs!
-                            # Pattern: https://skoob.s3.amazonaws.com/livros/{BOOK_ID}/...
-                            # Look for /livros/{BOOK_ID}/ pattern in image URL
-                            id_match = re.search(r'/livros/(\d+)/', img_src)
-                            if id_match:
-                                book_id = id_match.group(1)
-                                logger.debug(f"Extracted book ID {book_id} from image URL: {img_src[:100]}")
-                
-                # Method 4: Try to extract from React component props via JavaScript
-                if not book_id:
-                    try:
-                        book_id = book_element.evaluate('''(container) => {
-                            // Look for React Fiber node data
-                            const keys = Object.keys(container);
-                            for (const key of keys) {
-                                if (key.startsWith('__reactFiber') || key.startsWith('__reactInternalInstance')) {
-                                    let fiber = container[key];
-                                    for (let i = 0; i < 20 && fiber; i++) {
-                                        if (fiber.memoizedProps) {
-                                            const props = fiber.memoizedProps;
-                                            // Check for book ID in props
-                                            if (props.bookId || props.book_id || props.editionId || props.edition_id) {
-                                                return props.bookId || props.book_id || props.editionId || props.edition_id;
-                                            }
-                                            // Check for href in props
-                                            if (props.href && (props.href.includes('/book/') || props.href.includes('/livro/'))) {
-                                                return props.href;
-                                            }
-                                        }
-                                        if (fiber.memoizedState) {
-                                            const state = fiber.memoizedState;
-                                            if (state.memoizedState) {
-                                                const memoized = state.memoizedState;
-                                                if (memoized.bookId || memoized.book_id || memoized.editionId) {
-                                                    return memoized.bookId || memoized.book_id || memoized.editionId;
-                                                }
-                                            }
-                                        }
-                                        fiber = fiber.return || fiber._debugOwner;
-                                    }
-                                }
-                            }
-                            return null;
-                        }''')
-                        if book_id and isinstance(book_id, str) and not book_id.startswith('http'):
-                            # If it's just an ID, construct URL
-                            if book_id.isdigit():
-                                book_id = int(book_id)
-                    except Exception as e:
-                        logger.debug(f"Error extracting from React props: {e}")
+                # NOTE: Image URLs contain edition IDs, not book IDs!
+                # We should NOT use image URLs to extract book IDs
+                # The edition ID in the image URL (e.g., /livros/410286/) is NOT the book page ID
+                # Instead, we rely on API response map or React props
                 
                 if book_id:
-                    if isinstance(book_id, str) and (book_id.startswith('http') or book_id.startswith('/')):
-                        book_url = book_id
-                    else:
-                        book_url = f"{SKOOB_BASE_URL}/pt/book/{book_id}"
+                    book_url = f"{SKOOB_BASE_URL}/pt/book/{book_id}"
+                
+                # Method 4: Try to extract href from Next.js Link component
+                # The image is usually wrapped in a Next.js Link component with the correct href
+                if not book_url:
+                    try:
+                        img_elem = book_element.query_selector('img[alt^="Capa do livro"]')
+                        if img_elem:
+                            # Find the parent Link component and extract its href
+                            book_url = img_elem.evaluate('''(img) => {
+                                // Walk up the DOM to find the Link component
+                                let current = img;
+                                for (let i = 0; i < 15 && current; i++) {
+                                    // Check if current element has href (Link component)
+                                    if (current.href && (current.href.includes('/book/') || current.href.includes('/livro/'))) {
+                                        return current.href;
+                                    }
+                                    // Check for Next.js Link href attribute
+                                    const href = current.getAttribute && current.getAttribute('href');
+                                    if (href && (href.includes('/book/') || href.includes('/livro/'))) {
+                                        // Make it absolute if relative
+                                        if (href.startsWith('/')) {
+                                            return 'https://www.skoob.com.br' + href;
+                                        }
+                                        return href;
+                                    }
+                                    // Check React props for href
+                                    const keys = Object.keys(current);
+                                    for (const key of keys) {
+                                        if (key.startsWith('__reactFiber') || key.startsWith('__reactInternalInstance')) {
+                                            let fiber = current[key];
+                                            for (let j = 0; j < 25 && fiber; j++) {
+                                                if (fiber.memoizedProps) {
+                                                    const props = fiber.memoizedProps;
+                                                    // Look for href in props (Next.js Link)
+                                                    if (props.href && (props.href.includes('/book/') || props.href.includes('/livro/'))) {
+                                                        const href = props.href;
+                                                        if (href.startsWith('/')) {
+                                                            return 'https://www.skoob.com.br' + href;
+                                                        }
+                                                        return href;
+                                                    }
+                                                    // Look for as prop (Next.js Link alternative)
+                                                    if (props.as && (props.as.includes('/book/') || props.as.includes('/livro/'))) {
+                                                        const href = props.as;
+                                                        if (href.startsWith('/')) {
+                                                            return 'https://www.skoob.com.br' + href;
+                                                        }
+                                                        return href;
+                                                    }
+                                                }
+                                                fiber = fiber.return || fiber._debugOwner;
+                                            }
+                                        }
+                                    }
+                                    current = current.parentElement;
+                                }
+                                return null;
+                            }''')
+                    except Exception as e:
+                        logger.debug(f"Error extracting href from Link component: {e}")
             except Exception as e:
                 logger.debug(f"Error extracting book ID: {e}")
         
@@ -431,6 +416,7 @@ def extract_book_data(book_element, book_id_map=None):
                 book_data['book_url'] = book_url
             else:
                 logger.debug(f"URL doesn't look like a book URL: {book_url}")
+                book_data.pop('book_url', None)
         
         # Extract any data attributes that might contain book info
         data_attrs = ['data-id', 'data-livro-id', 'data-book-id']
@@ -558,7 +544,7 @@ def scrape_book_details_batch(book_urls, max_workers=10):
     return results
 
 
-def scrape_estante(page):
+def convert_api_to_csv_format(api_item):
     """Scrape all books from the Estante page."""
     books = []
     page_num = 1
@@ -571,21 +557,48 @@ def scrape_estante(page):
             try:
                 url = response.url
                 # Look for bookshelf API endpoints
-                if 'bookshelf' in url or 'book' in url:
+                if '/api/v2/bookshelf' in url or '/api/bookshelf' in url or 'bookshelf' in url.lower():
                     try:
                         json_data = response.json()
+                        logger.debug(f"API Response from {url}: {str(json_data)[:500]}")
+                        
                         # Try to extract book IDs from the response
                         if isinstance(json_data, dict):
-                            # Look for books array
-                            books_data = json_data.get('books', []) or json_data.get('data', []) or json_data.get('items', [])
+                            # Look for books array in various possible locations
+                            books_data = (json_data.get('books', []) or 
+                                        json_data.get('data', []) or 
+                                        json_data.get('items', []) or
+                                        json_data.get('results', []))
+                            
+                            if not books_data and isinstance(json_data.get('data'), dict):
+                                # Sometimes data is a dict with books inside
+                                books_data = json_data['data'].get('books', []) or json_data['data'].get('items', [])
+                            
                             for book in books_data:
                                 if isinstance(book, dict):
-                                    book_id = book.get('id') or book.get('book_id') or book.get('edition_id') or book.get('editionId')
+                                    # Prioritize book_id over edition_id
+                                    # book_id is the actual book page ID, edition_id is just for the cover image
+                                    book_id = (book.get('book_id') or 
+                                             book.get('bookId') or
+                                             book.get('id'))  # Sometimes 'id' is the book_id
+                                    
+                                    # Also check nested book object
+                                    if not book_id and isinstance(book.get('book'), dict):
+                                        book_id = (book['book'].get('id') or 
+                                                 book['book'].get('book_id') or
+                                                 book['book'].get('bookId'))
+                                    
                                     title = book.get('title') or book.get('name')
+                                    edition_id = book.get('edition_id') or book.get('editionId')
+                                    
                                     if book_id and title:
                                         book_id_map[title.lower()] = str(book_id)
-                    except Exception:
-                        pass
+                                        logger.debug(f"API: Mapped '{title}' -> book_id {book_id} (edition_id: {edition_id})")
+                                    elif title:
+                                        # Log when we have title but no book_id
+                                        logger.warning(f"API: Found '{title}' but no book_id (has edition_id: {edition_id}, keys: {list(book.keys())})")
+                    except Exception as e:
+                        logger.debug(f"Error parsing API response from {url}: {e}")
             except Exception:
                 pass
         
@@ -774,7 +787,7 @@ def scrape_estante(page):
                 if next_page_num > 18:
                     logger.info(f"Reached maximum page limit (18). Stopping pagination.")
                     break
-                
+            
                 # Construct next URL, preserving filter
                 base_url = estante_url.split('?')[0]
                 if '?' in estante_url:
@@ -874,14 +887,14 @@ def scrape_estante(page):
             book_urls_to_fetch = []
             
             # First pass: extract basic data and collect URLs
+            # We'll extract data first, then click to get URLs in a second pass to avoid stale handles
+            page_books = []
+            
+            # Extract basic data from all books first (without clicking)
             for i, book_elem in enumerate(book_elements, 1):
                 try:
                     book_data = extract_book_data(book_elem, book_id_map=book_id_map)
                     if book_data.get('title'):  # Only add if we found at least a title
-                        if book_data.get('book_url'):
-                            book_urls_to_fetch.append(book_data['book_url'])
-                        else:
-                            logger.warning(f"Book {i} '{book_data.get('title', 'Unknown')}' has no URL - cannot fetch details")
                         page_books.append(book_data)
                         logger.info(f"Extracted book {i}/{len(book_elements)}: {book_data.get('title', 'Unknown')} (URL: {book_data.get('book_url', 'None')})")
                     else:
@@ -889,6 +902,109 @@ def scrape_estante(page):
                 except Exception as e:
                     logger.warning(f"Error processing book {i}: {e}")
                     continue
+            
+            # Second pass: click each book to get the correct URL
+            # Re-query elements to avoid stale handles
+            book_elements = page.query_selector_all('div.relative.flex.flex-col')
+            
+            for i, book_data in enumerate(page_books, 1):
+                try:
+                    # ALWAYS click the image to intercept navigation and get the correct URL
+                    # This ensures we get the book ID, not the edition ID
+                    if i <= len(book_elements):
+                        current_book_elem = book_elements[i-1]
+                        img_elem = current_book_elem.query_selector('img[alt^="Capa do livro"]')
+                        if img_elem:
+                            # Click the image and wait for navigation to complete
+                            # Then get the final URL from the page
+                            try:
+                                with page.expect_navigation(timeout=5000, wait_until='domcontentloaded') as navigation_info:
+                                    img_elem.click(timeout=2000)
+                                
+                                # Get the final URL after navigation
+                                nav_url = navigation_info.value.url if navigation_info.value else page.url
+                                
+                                # Filter out JavaScript chunks and other non-book URLs
+                                if '/pt/book/' in nav_url or '/book/' in nav_url:
+                                    # Extract just the book page URL (not JS chunks)
+                                    if '/_next/' not in nav_url and '.js' not in nav_url:
+                                        book_data['book_url'] = nav_url
+                                        logger.debug(f"Captured URL from navigation for '{book_data['title']}': {nav_url}")
+                                    else:
+                                        # Try to extract book ID from URL pattern
+                                        import re
+                                        match = re.search(r'/book/(\d+)', nav_url)
+                                        if match:
+                                            book_id = match.group(1)
+                                            book_data['book_url'] = f"{SKOOB_BASE_URL}/pt/book/{book_id}"
+                                            logger.debug(f"Extracted book ID from URL for '{book_data['title']}': {book_data['book_url']}")
+                                        else:
+                                            logger.warning(f"Got non-book URL for '{book_data['title']}': {nav_url}")
+                                else:
+                                    logger.warning(f"Navigation did not go to book page for '{book_data['title']}': {nav_url}")
+                                
+                                # Navigate back to bookshelf
+                                try:
+                                    page.go_back(timeout=5000)
+                                    # Wait for page to load
+                                    page.wait_for_selector('img[alt^="Capa do livro"]', timeout=10000)
+                                    # Re-query book elements after navigation to avoid stale handles
+                                    book_elements = page.query_selector_all('div.relative.flex.flex-col')
+                                except Exception as e:
+                                    logger.warning(f"Error navigating back after clicking '{book_data['title']}': {e}")
+                                    # If back fails, re-navigate to bookshelf
+                                    try:
+                                        page.goto(estante_url, timeout=60000, wait_until='domcontentloaded')
+                                        page.wait_for_selector('img[alt^="Capa do livro"]', timeout=30000)
+                                        # Re-query book elements after navigation
+                                        book_elements = page.query_selector_all('div.relative.flex.flex-col')
+                                    except Exception as e2:
+                                        logger.error(f"Failed to return to bookshelf page: {e2}")
+                            except Exception as nav_error:
+                                # Navigation timeout or error - try alternative approach
+                                logger.debug(f"Navigation timeout/error for '{book_data['title']}': {nav_error}")
+                                # Try to get URL from the click event or element's href
+                                try:
+                                    # Re-query element in case it's stale
+                                    book_elements = page.query_selector_all('div.relative.flex.flex-col')
+                                    if i <= len(book_elements):
+                                        current_book_elem = book_elements[i-1]
+                                        img_elem = current_book_elem.query_selector('img[alt^="Capa do livro"]')
+                                        if img_elem:
+                                            # Get href from the parent link element
+                                            href = img_elem.evaluate('''(img) => {
+                                                let current = img;
+                                                for (let i = 0; i < 10 && current; i++) {
+                                                    if (current.href && (current.href.includes('/book/') || current.href.includes('/livro/'))) {
+                                                        return current.href;
+                                                    }
+                                                    const href = current.getAttribute && current.getAttribute('href');
+                                                    if (href && (href.includes('/book/') || href.includes('/livro/'))) {
+                                                        return href.startsWith('/') ? 'https://www.skoob.com.br' + href : href;
+                                                    }
+                                                    current = current.parentElement;
+                                                }
+                                                return null;
+                                            }''')
+                                            if href and '/_next/' not in href and '.js' not in href:
+                                                book_data['book_url'] = href
+                                                logger.debug(f"Got URL from element href for '{book_data['title']}': {href}")
+                                except Exception as e:
+                                    logger.debug(f"Error getting href from element for '{book_data['title']}': {e}")
+                        else:
+                            logger.warning(f"Could not find image element for book {i} '{book_data['title']}'")
+                    else:
+                        logger.warning(f"Could not find book element at index {i-1} for '{book_data['title']}'")
+                except Exception as e:
+                    logger.debug(f"Error trying to get URL via click for '{book_data['title']}': {e}")
+            
+            # Collect URLs for detail fetching
+            book_urls_to_fetch = []
+            for book_data in page_books:
+                if book_data.get('book_url'):
+                    book_urls_to_fetch.append(book_data['book_url'])
+                else:
+                    logger.warning(f"Book '{book_data.get('title', 'Unknown')}' has no URL - cannot fetch details")
             
             # Second pass: fetch book details in parallel (much faster!)
             if book_urls_to_fetch:
@@ -966,12 +1082,12 @@ def scrape_estante(page):
                         if 'filter=' in url_without_page:
                             separator = '&' if '?' in url_without_page else '?'
                             next_url = f"{url_without_page}{separator}page={next_page_num}"
-                        else:
-                            separator = '&' if '?' in url_without_page else '?'
-                            next_url = f"{url_without_page}{separator}page={next_page_num}&filter=read"
                     else:
-                        # Add both page and filter parameters
-                        next_url = f"{base_url}?page={next_page_num}&filter=read"
+                        separator = '&' if '?' in url_without_page else '?'
+                        next_url = f"{url_without_page}{separator}page={next_page_num}&filter=read"
+                else:
+                    # Add both page and filter parameters
+                    next_url = f"{base_url}?page={next_page_num}&filter=read"
                 
             except Exception as e:
                 logger.debug(f"Pagination check error: {e}")
@@ -1016,6 +1132,63 @@ def scrape_estante(page):
         logger.info(f"Returning {len(books)} books scraped so far")
     
     return books
+
+
+def convert_api_to_csv_format(api_item):
+    """
+    Convert API response item to CSV format.
+    
+    Args:
+        api_item: Dictionary from API response items array
+    
+    Returns:
+        Dictionary with CSV-compatible field names
+    """
+    csv_book = {}
+    
+    # Direct mappings
+    if 'title' in api_item:
+        csv_book['title'] = api_item['title']
+    if 'author' in api_item:
+        csv_book['author'] = api_item['author']
+    if 'rating' in api_item:
+        csv_book['rating'] = api_item['rating']
+    if 'year' in api_item:
+        csv_book['year_published'] = api_item['year']
+    if 'pages' in api_item:
+        csv_book['pages'] = api_item['pages']
+    if 'publisher' in api_item:
+        csv_book['publisher'] = api_item['publisher']
+    if 'finished_at' in api_item:
+        # Convert ISO date to readable format
+        try:
+            if api_item['finished_at']:
+                date_obj = datetime.fromisoformat(api_item['finished_at'].replace('Z', '+00:00'))
+                csv_book['date_read'] = date_obj.strftime('%Y-%m-%d')
+        except:
+            csv_book['date_read'] = api_item['finished_at']
+    if 'cover_filename' in api_item:
+        csv_book['cover_url'] = api_item['cover_filename']
+    
+    # Construct book URL from slug
+    if 'slug' in api_item:
+        slug = api_item['slug']
+        if slug.startswith('http'):
+            csv_book['book_url'] = slug
+        else:
+            csv_book['book_url'] = f"{SKOOB_BASE_URL}/{slug}"
+    
+    # Fields not in API - will be filled later from book pages
+    csv_book['isbn'] = None
+    csv_book['average_rating'] = None
+    csv_book['binding'] = None
+    csv_book['original_publication_year'] = None
+    csv_book['date_added'] = None
+    csv_book['shelves'] = None
+    csv_book['bookshelves'] = None
+    csv_book['review'] = None
+    
+    return csv_book
 
 
 def export_to_csv(books, filename=None):
@@ -1064,63 +1237,91 @@ def export_to_csv(books, filename=None):
         return None
 
 
-def main():
-    """Main execution function."""
+def main(debug=False):
+    """
+    Main execution function.
+    
+    Args:
+        debug: If True, enable debug logging and save debug files
+    """
     logger.info("Starting Skoob Bookshelf Scraper...")
     
-    with sync_playwright() as p:
-        # Launch browser (using Chromium)
-        logger.info("Launching browser...")
-        browser = p.chromium.launch(headless=False)  # headless=False so user can see and interact
-        context = browser.new_context()
-        page = context.new_page()
+    # Import API request module
+    try:
+        from api_request import fetch_bookshelf_data
+    except ImportError as e:
+        logger.error(f"Failed to import api_request module: {e}")
+        logger.error("Make sure api_request.py is in the same directory")
+        return
+    
+    # Fetch data from API
+    logger.info("Fetching bookshelf data from API...")
+    api_data = fetch_bookshelf_data(debug=debug)
+    
+    if not api_data or not api_data.get('items'):
+        logger.error("Failed to fetch data from API or no items found")
+        return
+    
+    items = api_data.get('items', [])
+    logger.info(f"Fetched {len(items)} books from API")
+    
+    # Convert API items to CSV format
+    books = []
+    book_urls = []
+    for item in items:
+        csv_book = convert_api_to_csv_format(item)
+        books.append(csv_book)
+        if csv_book.get('book_url'):
+            book_urls.append(csv_book['book_url'])
+    
+    # Fetch missing fields from individual book pages
+    if book_urls:
+        logger.info(f"Fetching missing details (ISBN, average_rating, binding) for {len(book_urls)} books...")
+        details_results = scrape_book_details_batch(book_urls, max_workers=15)
         
-        try:
-            # Navigate to login page
-            logger.info(f"Navigating to login page: {LOGIN_URL}")
-            page.goto(LOGIN_URL, wait_until='networkidle', timeout=30000)
-            
-            # Wait for manual login
-            if not wait_for_manual_login(page):
-                logger.error("Authentication failed or not detected")
-                return
-            
-            # Scrape Estante using hardcoded URL
-            logger.info(f"Navigating to bookshelf: {ESTANTE_URL}")
-            books = scrape_estante(page)
-            
-            if books:
-                logger.info(f"Successfully scraped {len(books)} books")
-                # Export to CSV
-                csv_file = export_to_csv(books)
-                if csv_file:
-                    logger.info(f"Data exported successfully to {csv_file}")
-                else:
-                    logger.error("Failed to export data to CSV")
-            else:
-                logger.warning("No books were scraped. Please check:")
-                logger.warning("1. Are you logged in correctly?")
-                logger.warning("2. Do you have books in your Estante?")
-                logger.warning("3. The page structure might have changed")
-                
-                # Save page HTML for debugging
-                debug_file = f"debug_page_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
-                with open(debug_file, 'w', encoding='utf-8') as f:
-                    f.write(page.content())
-                logger.info(f"Page HTML saved to {debug_file} for debugging")
-        
-        except Exception as e:
-            logger.error(f"Unexpected error: {e}", exc_info=True)
-        
-        finally:
-            # Keep browser open for a moment so user can see results
-            logger.info("Scraping complete. Browser will close in 5 seconds...")
-            time.sleep(5)
-            browser.close()
+        # Merge details into books
+        for book in books:
+            book_url = book.get('book_url')
+            if book_url and book_url in details_results:
+                details = details_results[book_url]
+                # Update with fetched details (don't overwrite existing data)
+                if details.get('isbn'):
+                    book['isbn'] = details['isbn']
+                if details.get('average_rating'):
+                    book['average_rating'] = details['average_rating']
+                if details.get('binding'):
+                    book['binding'] = details['binding']
+                if details.get('original_publication_year'):
+                    book['original_publication_year'] = details.get('original_publication_year')
+    
+    if books:
+        logger.info(f"Successfully processed {len(books)} books")
+        # Export to CSV
+        csv_file = export_to_csv(books)
+        if csv_file:
+            logger.info(f"Data exported successfully to {csv_file}")
+        else:
+            logger.error("Failed to export data to CSV")
+    else:
+        logger.warning("No books were processed")
     
     logger.info("Done!")
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    
+    # Check for debug flag
+    debug = "--debug" in sys.argv or "-d" in sys.argv
+    
+    # Set logging level based on debug flag
+    if debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.setLevel(logging.DEBUG)
+        logger.info("Debug mode enabled")
+    else:
+        logging.getLogger().setLevel(logging.INFO)
+        logger.setLevel(logging.INFO)
+    
+    main(debug=debug)
 
